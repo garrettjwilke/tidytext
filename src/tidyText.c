@@ -9,9 +9,6 @@ static const TileSet* selectedFont = &tidyText_font_01_short;
 // this is the amount of pixels in between each character
 static const u8 characterPadding = 1;
 
-// Default character width can be less than 8 but never more! characters must fit in a tile
-#define DEFAULT_CHAR_WIDTH 8
-
 // after doing a reset, should we erase the tiles from vram
 static bool eraseTilesAfterReset = FALSE;
 
@@ -33,7 +30,7 @@ static u16 cacheSize = 0;       // Current number of entries in cache
 
 #define MAX_CHAR_ASCII 127 
 
-// Only characters with custom widths are specified; others default to 0 (handled in lookup)
+// A zero entry is 8 pixels wide. No character is wider than one tile.
 static const u8 charWidthLookup[MAX_CHAR_ASCII + 1] = {
     // Override with custom widths from charWidthMap
     [' '] = 2,   // space
@@ -133,62 +130,20 @@ static const u8 charWidthLookup[MAX_CHAR_ASCII + 1] = {
     ['z'] = 3
 };
 
-// Returns DEFAULT_CHAR_WIDTH for uninitialized entries (value 0)
-static u8 tidyText_GetCharWidth(u8 asciiChar)
-{
-    if (asciiChar <= MAX_CHAR_ASCII) {
-        u8 width = charWidthLookup[asciiChar];
-        return (width != 0) ? width : DEFAULT_CHAR_WIDTH;
-    }
-    return DEFAULT_CHAR_WIDTH;
-}
+typedef struct {
+    u32 font;
+    u32 widths;
+    u32 str;
+    u32 tileData;
+    u32 strLen;
+    u32 maxTiles;
+    u32 padding;
+    u32 primary;
+    u32 secondary;
+} TidyTextPackParams;
 
-// Mask character data to only include pixels 0 to width-1
-// This ensures pixels beyond the character width are explicitly cleared
-static void tidyText_MaskCharData(u32* charData, u8 width)
-{
-    // Create a mask that includes only the first 'width' pixels (pixels 0 to width-1)
-    // Each pixel is 4 bits, so pixel 0 is bits 31-28, pixel 1 is bits 27-24, etc.
-    // For width pixels, we need bits 31 down to (32 - width*4)
-    // Example: width=4 -> mask = 0xFFFF0000 (covers pixels 0-3, clears pixels 4-7)
-    u32 mask = 0xFFFFFFFF << (32 - (width << 2));
-    
-    // Apply mask to each row to clear pixels beyond the character width
-    for (u8 row = 0; row < 8; row++) {
-        charData[row] &= mask;
-    }
-}
+extern u16 tidyText_PackString(const TidyTextPackParams* params);
 
-static void tidyText_RemapPaletteIndices(u32* tileData, u8 primaryPaletteIndex, u8 secondaryPaletteIndex)
-{
-    for (u8 row = 0; row < 8; row++) {
-        u32 rowData = tileData[row];
-        u32 remappedRow = 0;
-        
-        // Process each pixel (8 pixels per row)
-        for (u8 pix = 0; pix < 8; pix++) {
-            // Extract the 4-bit palette index for this pixel
-            u8 pixelIndex = (rowData >> (28 - (pix << 2))) & 0xF;
-            
-            // Remap: index 1 -> primaryPaletteIndex, index 2 -> secondaryPaletteIndex, index 0 -> 0
-            u8 remappedIndex;
-            if (pixelIndex == 1) {
-                remappedIndex = primaryPaletteIndex;
-            } else if (pixelIndex == 2) {
-                remappedIndex = secondaryPaletteIndex;
-            } else if (pixelIndex == 0) {
-                remappedIndex = 0;
-            } else {
-                remappedIndex = 0;  // remove all other pixels not in indexes 0-2
-            }
-            
-            // Place the remapped index back into the row
-            remappedRow |= ((u32)remappedIndex) << (28 - (pix << 2));
-        }
-        
-        tileData[row] = remappedRow;
-    }
-}
 
 // Calculate the starting tile index (working backwards from font tiles)
 static u16 tidyText_GetBaseTileIndex(void)
@@ -197,186 +152,47 @@ static u16 tidyText_GetBaseTileIndex(void)
     return baseIndex;
 }
 
-static void tidyText_GetCharTileData(u8 asciiCharIndex, u32* outTileData)
-{
-    const u32* tilesetData = (const u32*)selectedFont->tiles;
-    
-    // Map ASCII character to tile index
-    u16 tileIndex;
-    
-    // Handle special characters that might be in different positions in the font
-    if (asciiCharIndex >= '!' && asciiCharIndex <= '~') {
-        tileIndex = asciiCharIndex - 32;
-    } else {
-        // Other characters - try to map or use a default
-        tileIndex = 0;  // Default to space/empty
-    }
-    
-    const u32* charTile = &tilesetData[tileIndex << 3];
-    
-    for (u8 i = 0; i < 8; i++) {
-        outTileData[i] = charTile[i];
-    }
-}
-
-static void tidyText_PlaceCharPixels(const u32* charData, u32* outTile, u8 charStartPixel, u8 numPixels, u8 tilePixelOffset)
-{
-    // Each u32 row: bits 31-28=pixel0, 27-24=pixel1, ..., 3-0=pixel7
-    // Character has pixels 0-7 in bits 31-0 (0xFFFFFFFF)
-    
-    // Limit numPixels to ensure we don't exceed character bounds
-    if (charStartPixel + numPixels > 8) {
-        numPixels = 8 - charStartPixel;
-    }
-    if (numPixels == 0) return;
-    
-    for (u8 row = 0; row < 8; row++) {
-        u32 charRow = charData[row];
-        
-        // Build mask for source pixels: charStartPixel to charStartPixel+numPixels-1
-        // Only extract pixels that are within the character (0-7)
-        u32 sourceMask = 0;
-        for (u8 i = 0; i < numPixels; i++) {
-            u8 pix = charStartPixel + i;
-            if (pix < 8) {  // Character has pixels 0-7
-                sourceMask |= (0xF << (28 - (pix << 2)));
-            }
-        }
-        
-        u32 extracted = charRow & sourceMask;
-        
-        // Shift left to move extracted pixels to position 0 (MSB)
-        // If pixels are at positions charStartPixel..charStartPixel+numPixels-1,
-        // shift left by charStartPixel*4 to get them to positions 0..numPixels-1
-        extracted = extracted << (charStartPixel << 2);
-        
-        // Mask to keep only numPixels at MSB (ensure we don't include extra pixels)
-        u32 numPixelsMask = 0xFFFFFFFF << (32 - (numPixels << 2));
-        extracted &= numPixelsMask;
-        
-        // We need to shift right by tilePixelOffset*4 to place them correctly
-        u32 result = extracted >> (tilePixelOffset << 2);
-        
-        // For 4 pixels at offset 0: destMask = 0xFFFF0000 (only pixels 0-3)
-        u32 destMask = numPixelsMask >> (tilePixelOffset << 2);
-        
-        // This ensures we only write to the exact pixels we want
-        outTile[row] = (outTile[row] & ~destMask) | (result & destMask);
-    }
-}
 
 // Maximum tiles we can build at once (supports strings up to ~85 characters)
 #define MAX_TILES_PER_STRING 64
 
-// Returns the number of tiles actually used
+
 static u16 tidyText_BuildStringTiles(const char* str, u16 strLen, u16* outTileIndices, u8 primaryPaletteIndex, u8 secondaryPaletteIndex)
 {
-    // Clamp palette indices to valid range (0-15)
     if (primaryPaletteIndex > 15) {
         primaryPaletteIndex = 15;
     }
     if (secondaryPaletteIndex > 15) {
         secondaryPaletteIndex = 15;
     }
-    
-    // Use static buffer for tile data (avoid malloc)
+
     static u32 tileData[MAX_TILES_PER_STRING << 3];
-    
-    // Initialize all tiles to zero
-    for (u16 i = 0; i < (MAX_TILES_PER_STRING << 3); i++) {
-        tileData[i] = 0;
+
+    TidyTextPackParams params;
+    params.font = (u32) selectedFont->tiles;
+    params.widths = (u32) charWidthLookup;
+    params.str = (u32) str;
+    params.tileData = (u32) tileData;
+    params.strLen = strLen;
+    params.maxTiles = MAX_TILES_PER_STRING;
+    params.padding = characterPadding;
+    params.primary = primaryPaletteIndex;
+    params.secondary = secondaryPaletteIndex;
+
+    u16 numTilesUsed = tidyText_PackString(&params);
+    if (numTilesUsed == 0) {
+        return 0;
     }
-    
-    // Track current position in tiles
-    u16 currentTile = 0;
-    u8 currentPixelPos = 0;  // Current pixel position within the current tile (0-7)
-    u16 numTilesUsed = 0;
-    
-    // Process each character and place it at the appropriate position
-    for (u16 pos = 0; pos < strLen; pos++) {
-        u8 asciiChar = str[pos];
-        
-        // Safety check
-        if (currentTile >= MAX_TILES_PER_STRING) break;
-        
-        // Get character width (original, without padding)
-        u8 charWidth = tidyText_GetCharWidth(asciiChar);
-        u32 charData[8];
-        tidyText_GetCharTileData(asciiChar, charData);
-        
-        // Remap palette indices: index 15 -> primaryPaletteIndex, index 14 -> secondaryPaletteIndex, index 0 -> 0
-        tidyText_RemapPaletteIndices(charData, primaryPaletteIndex, secondaryPaletteIndex);
-        
-        // Mask character data to only include pixels 0 to charWidth-1
-        tidyText_MaskCharData(charData, charWidth);
-        
-        // Check if character fits in current tile
-        if (currentPixelPos + charWidth <= 8) {
-            // Character fits entirely in current tile
-            tidyText_PlaceCharPixels(charData, &tileData[currentTile << 3], 0, charWidth, currentPixelPos);
-            currentPixelPos += charWidth;
-        } else {
-            // Character spans across two tiles
-            u8 pixelsInFirstTile = 8 - currentPixelPos;
-            u8 pixelsInSecondTile = charWidth - pixelsInFirstTile;
-            
-            // Place first part in current tile
-            if (currentTile < MAX_TILES_PER_STRING) {
-                tidyText_PlaceCharPixels(charData, &tileData[currentTile << 3], 0, pixelsInFirstTile, currentPixelPos);
-            }
-            
-            // Move to next tile
-            currentTile++;
-            if (currentTile > numTilesUsed) {
-                numTilesUsed = currentTile;
-            }
-            
-            // Place second part in next tile
-            if (currentTile < MAX_TILES_PER_STRING && pixelsInSecondTile > 0) {
-                tidyText_PlaceCharPixels(charData, &tileData[currentTile << 3], pixelsInFirstTile, pixelsInSecondTile, 0);
-                currentPixelPos = pixelsInSecondTile;
-            } else {
-                currentPixelPos = 0;
-            }
-        }
-        
-        // Add padding after the character (except for the last character)
-        if (pos < strLen - 1) {  // Don't add padding after the last character
-            currentPixelPos += characterPadding;
-            
-            // Handle padding that spans tiles
-            while (currentPixelPos >= 8) {
-                currentTile++;
-                currentPixelPos -= 8;
-                if (currentTile > numTilesUsed) {
-                    numTilesUsed = currentTile;
-                }
-                if (currentTile >= MAX_TILES_PER_STRING) break;
-            }
-        }
-    }
-    
-    // Calculate actual number of tiles used (add one if current tile has content)
-    if (currentPixelPos > 0 || numTilesUsed == 0) {
-        numTilesUsed = currentTile + 1;
-    } else {
-        numTilesUsed = currentTile;
-    }
-    
-    if (numTilesUsed > MAX_TILES_PER_STRING) {
-        numTilesUsed = MAX_TILES_PER_STRING;
-    }
-    
-    // Allocate VRAM tiles and load them
+
     u16 baseIndex = tidyText_GetBaseTileIndex();
+    u16 start = baseIndex - tilesAllocated - numTilesUsed;
+    tilesAllocated += numTilesUsed;
+
     for (u16 i = 0; i < numTilesUsed; i++) {
-        u16 tileIndex = baseIndex - tilesAllocated - 1;
-        tilesAllocated++;
-        outTileIndices[i] = tileIndex;
-        VDP_loadTileData(&tileData[i << 3], tileIndex, 1, DMA);
+        outTileIndices[i] = start + i;
     }
-    //VDP_waitDMACompletion();
-    
+    VDP_loadTileData(tileData, start, numTilesUsed, DMA);
+
     return numTilesUsed;
 }
 
@@ -419,14 +235,12 @@ void drawStrings(u8 x, u8 y, u8 plane, u8 palette, u8 primaryPaletteIndex, u8 se
         palette = 3;
     }
     
+    u16 rowTiles[MAX_TILES_PER_STRING];
+    u16 attr = TILE_ATTR_FULL(palette, 0, 0, 0, 0);
     for (u16 tileNum = 0; tileNum < numTiles; tileNum++) {
-        VDP_setTileMapXY(
-            plane,
-            TILE_ATTR_FULL(palette, 0, 0, 0, tileIndices[tileNum]),
-            x + tileNum,
-            y
-        );
+        rowTiles[tileNum] = attr + tileIndices[tileNum];
     }
+    VDP_setTileMapDataRow(plane, rowTiles, y, x, numTiles, CPU);
 }
 
 void tidyText_Single(u8 x, u8 y, u8 plane, u8 palette, u8 primaryPaletteIndex, u8 secondaryPaletteIndex, const char* format, ...)
@@ -439,6 +253,7 @@ void tidyText_Single(u8 x, u8 y, u8 plane, u8 palette, u8 primaryPaletteIndex, u
     
     drawStrings(x, y, plane, palette, primaryPaletteIndex, secondaryPaletteIndex, buffer);
 }
+
 
 void tidyText_Multi(u8 x, u8 y, u8 plane, u8 palette, u8 primaryPaletteIndex, u8 secondaryPaletteIndex, const tidyTextStringStruct* tidyTextStrings)
 {
